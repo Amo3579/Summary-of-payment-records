@@ -9,3 +9,5 @@
 * pillow
 * pandas
 * matplotlib
+* paddlepaddle
+* paddleocr
