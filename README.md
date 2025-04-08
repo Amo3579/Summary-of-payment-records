@@ -5,9 +5,8 @@
 
 # Environment
 * python3.8
-* pytesseract
+* easyocr
 * pillow
 * pandas
 * matplotlib
-* paddlepaddle
-* paddleocr
+
