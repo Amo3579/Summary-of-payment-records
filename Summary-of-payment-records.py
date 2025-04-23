@@ -1,170 +1,291 @@
 import easyocr
-from PIL import Image
+import cv2
 import PIL.Image
 import pandas as pd
+import numpy as np
+import tkinter as tk
+from tkinter import ttk, filedialog
+from PIL import ImageTk, Image, ImageEnhance  # 导入 ImageResampling
 import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+import re
 import os
 import torch
-import re
+from datetime import datetime
+import matplotlib
 
-# 修补Pillow的ANTIALIAS属性
-PIL.Image.ANTIALIAS = PIL.Image.Resampling.LANCZOS
+matplotlib.rcParams['font.sans-serif'] = ['SimHei']
+matplotlib.rcParams['axes.unicode_minus'] = False
+CROP_Y, CROP_H = 300, 1700
 
-# 设置Matplotlib支持中文
-plt.rcParams['font.sans-serif'] = ['SimHei']
-plt.rcParams['axes.unicode_minus'] = False
+# 配置全局参数
+CONFIG = {
+    "preprocess": {
+        "resize_factor": 2,
+        "contrast_factor": 1.5,
+        "sharpness_factor": 2.0
+    },
+    "ocr": {
+        "languages": ["ch_sim", "en"],
+        "model_path": 'C:/Users/99362/.EasyOCR/model',
+        "gpu_threshold": 0.4  # 低于此值的GPU显存不启用CUDA
+    }
+}
 
 
-def ocr_image(image_path):
-    """使用EasyOCR从图像中提取文本"""
-    try:
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+class OCRApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("智能消费记录分析系统")
+        self.root.geometry("1200x800")
+
+        # 初始化变量
+        self.image_dir = ""
+        self.current_image = None
+        self.processed_images = []
+        self.df = pd.DataFrame()
+
+        # 创建界面组件
+        self.create_widgets()
+
+        # 初始化OCR阅读器
+        self.reader = self.init_ocr_reader()
+
+    def create_widgets(self):
+        """创建GUI组件"""
+        control_frame = ttk.LabelFrame(self.root, text="控制面板", padding=(10, 5))
+        control_frame.pack(side=tk.LEFT, fill=tk.Y, padx=10, pady=10)
+
+        ttk.Button(control_frame, text="选择图片目录", command=self.select_directory).pack(pady=5)
+        ttk.Button(control_frame, text="处理图片", command=self.process_images).pack(pady=5)
+        ttk.Button(control_frame, text="导出数据", command=self.export_data).pack(pady=5)
+
+        # 新增：放缩略图的 frame
+        self.thumb_frame = ttk.Frame(control_frame)
+        self.thumb_frame.pack(fill=tk.X, pady=10)
+
+        # 原来的预览大图标签
+        self.img_label = ttk.Label(control_frame)
+        self.img_label.pack(pady=10)
+
+        # 结果显示
+        result_frame = ttk.LabelFrame(self.root, text="分析结果", padding=(10, 5))
+        result_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+        # 表格显示
+        self.tree = ttk.Treeview(result_frame, columns=("time", "amount", "item"), show="headings")
+        self.tree.heading("time", text="时间")
+        self.tree.heading("amount", text="金额")
+        self.tree.heading("item", text="消费项目")
+        self.tree.pack(fill=tk.BOTH, expand=True)
+
+        # 图表显示
+        self.figure = plt.Figure(figsize=(8, 4))
+        self.canvas = FigureCanvasTkAgg(self.figure, master=result_frame)
+        self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
+    def init_ocr_reader(self):
+        """初始化OCR阅读器"""
+        device = 'cuda' if torch.cuda.is_available() and torch.cuda.get_device_properties(0).total_memory >= \
+                           CONFIG["ocr"]["gpu_threshold"] * 1e9 else 'cpu'
         print(f"使用设备: {device}")
-        reader = easyocr.Reader(['ch_sim', 'en'],
-                                model_storage_directory='C:/Users/99362/.EasyOCR/model',
-                                gpu=True if device == 'cuda' else False)
-        result = reader.readtext(image_path)
-        text = [item[1] for item in result]
-        print(f"OCR结果 ({image_path}): {text}")
-        return text
-    except Exception as e:
-        print(f"OCR处理图像 {image_path} 时出错: {e}")
-        return []
+        return easyocr.Reader(
+            CONFIG["ocr"]["languages"],
+            gpu=device == 'cuda',
+            model_storage_directory=CONFIG["ocr"]["model_path"],
+            quantize=False  # 禁用量化提升准确率
+        )
+
+    def preprocess_image(self, image_path):
+        """图像预处理"""
+        img = Image.open(image_path)
+        # ① 先裁剪列表区域
+        w, h = img.size
+        crop_top = CROP_Y
+        crop_bot = min(h, CROP_Y + CROP_H)
+        img = img.crop((0, crop_top, w, crop_bot))
+        # 调整尺寸
+        if CONFIG["preprocess"]["resize_factor"] != 1:
+            new_size = (int(img.width * CONFIG["preprocess"]["resize_factor"]),
+                        int(img.height * CONFIG["preprocess"]["resize_factor"]))
+            img = img.resize(new_size, Image.LANCZOS)  # 使用 ImageResampling.LANCZOS
+
+        # 增强对比度
+        enhancer = ImageEnhance.Contrast(img)
+        img = enhancer.enhance(CONFIG["preprocess"]["contrast_factor"])
+
+        # 锐化处理
+        enhancer = ImageEnhance.Sharpness(img)
+        img = enhancer.enhance(CONFIG["preprocess"]["sharpness_factor"])
+
+        # 转换为OpenCV格式进行进一步处理
+        cv_img = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+        gray = cv2.cvtColor(cv_img, cv2.COLOR_BGR2GRAY)
+        blur = cv2.GaussianBlur(gray, (5, 5), 0)
+        _, thresh = cv2.threshold(blur, 0, 255,
+                                  cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+        thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
+        return Image.fromarray(thresh)
+
+    def ocr_image(self, path):
+        proc = self.preprocess_image(path)
+        raw = self.reader.readtext(np.array(proc), paragraph=False, detail=1)
+        raw = sorted(raw, key=lambda x: x[0][0][1])
+        texts = [t[1].strip() for t in raw]
+        # 合并日期和时间，并统一时间格式
+        out = []
+        i = 0
+        date_re = re.compile(r'^\d{1,2}月\d{1,2}日$')
+        time_re = re.compile(r'^\d{1,2}[:\.]\d{2}$')  # 匹配 HH:MM 或 HH.MM
+        while i < len(texts):
+            if date_re.match(texts[i]) and i + 1 < len(texts) and time_re.match(texts[i + 1]):
+                time_str = texts[i + 1].replace('.', ':')  # 将点号替换为冒号
+                out.append(f"{texts[i]} {time_str}")
+                i += 2
+            else:
+                out.append(texts[i])
+                i += 1
+        return out, proc
+
+    def parse_text(self, lst):
+        recs = []
+        cur = {}
+        ym = None
+        now_year = datetime.now().year
+        for t in lst:
+            t = t.strip()
+            ym_m = re.search(r'(\d{4})年(\d{1,2})月', t)
+            if ym_m:
+                ym = f"{ym_m.group(1)}-{int(ym_m.group(2)):02d}"
+                continue
+            tm = re.search(r'(?:(\d{1,2})月(\d{1,2})日|(\d{2,4}-\d{2}-\d{2})|(\d{1,2}-\d{2}))\s*(\d{1,2}[:\.]\d{2})', t)
+            if tm:
+                month, day, full_date, short_date, time = tm.groups()
+                if full_date:
+                    date = full_date
+                elif short_date:
+                    m, d = short_date.split('-')
+                    date = f"{now_year}-{int(m):02d}-{int(d):02d}"
+                else:
+                    date = f"{ym.split('-')[0] if ym else now_year}-{int(month):02d}-{int(day):02d}"
+                time = time.replace('.', ':')  # 确保时间格式为 HH:MM
+                cur['time'] = f"{date} {time}"
+                continue
+            am = re.search(r'[￥¥]?\s*([+-]?\d+\.?\d*)', t)
+            if am:
+                val = float(am.group(1))
+                if any(w in t for w in ['退款', '返还', '返回']):
+                    val = abs(val)
+                cur['amount'] = val
+            if 'time' in cur:
+                item = re.sub(
+                    r'\d+[月/-]\d+[日]?.*?\d+:\d+|\d{2}-\d{2}\s*\d{2}:\d{2}|[￥¥+-]\d+\.?\d*|已?[全额部分]退款|返还|[\d\.]+',
+                    '', t).strip()
+                if item:
+                    cur['item'] = cur.get('item', '') + (' ' if cur.get('item') else '') + item
+            if all(k in cur for k in ['time', 'amount', 'item']):
+                recs.append(cur)
+                cur = {}
+        return recs
+
+    def chinese_to_arabic(self, text):
+        """中文数字转阿拉伯数字"""
+        chinese_numbers = {'零': 0, '一': 1, '二': 2, '三': 3, '四': 4,
+                           '五': 5, '六': 6, '七': 7, '八': 8, '九': 9}
+        unit_map = {'十': 10, '百': 100, '千': 1000, '万': 10000}
+
+        if re.match(r'^[+-]?\d+\.?\d*$', text):
+            return float(text)
+
+        total = 0
+        current = 0
+        for char in text:
+            if char in chinese_numbers:
+                current = chinese_numbers[char]
+            elif char in unit_map:
+                total += current * unit_map[char]
+                current = 0
+        return total + current
+
+    def clean_item(self, text):
+        """更新清洗逻辑"""
+        patterns = [
+            r'\d+月\d+日.*?\d+:\d+',  # 日期时间
+            r'[￥¥+-]\s?\d+\.?\d*',  # 金额
+            r'已?[全额部分]退款|返还',  # 退款标记
+            r'[\d\.]+',  # 残留数字
+            r'^[\-+*●·\s]+'  # 特殊符号前缀
+        ]
+        for pattern in patterns:
+            text = re.sub(pattern, '', text)
+        return text.strip()[:20]  # 限制项目名称长度
+
+    def select_directory(self):
+        """选择图片目录"""
+        self.image_dir = filedialog.askdirectory()
+        if self.image_dir:
+            self.show_thumbnail()
+
+    def show_thumbnail(self):
+        # 清掉旧的
+        for child in self.thumb_frame.winfo_children():
+            child.destroy()
+
+        # 按文件名排序，确保顺序可控
+        for f in sorted(os.listdir(self.image_dir)):
+            if f.lower().endswith(('.png', '.jpg', '.jpeg')):
+                path = os.path.join(self.image_dir, f)
+                img = Image.open(path)
+                img.thumbnail((100, 100))
+                tk_img = ImageTk.PhotoImage(img)
+
+                lbl = ttk.Label(self.thumb_frame, image=tk_img)
+                lbl.image = tk_img  # 保留引用，防止被 GC
+                lbl.pack(side=tk.LEFT, padx=5, pady=5)
+
+    def process_images(self):
+        self.df = pd.DataFrame()
+        for f in sorted(os.listdir(self.image_dir)):
+            if f.lower().endswith(('.png', '.jpg', '.jpeg')):
+                lines, _ = self.ocr_image(os.path.join(self.image_dir, f))
+                print(f"OCR 行内容：{lines}")
+                recs = self.parse_text(lines)
+                print(f"解析结果：{recs}")
+                self.df = pd.concat([self.df, pd.DataFrame(recs)], ignore_index=True)
+        self.update_results()
+
+    def update_results(self):
+        for i in self.tree.get_children():
+            self.tree.delete(i)
+        if self.df.empty:
+            return
+        # 预处理 time 列，确保时间格式正确
+        self.df['time'] = self.df['time'].str.replace('.', ':')
+        for _, r in self.df.iterrows():
+            self.tree.insert('', 'end', values=(r['time'], r['amount'], r['item']))
+        self.figure.clear()
+        ax = self.figure.add_subplot(111)
+        daily = self.df.groupby(pd.to_datetime(self.df['time']).dt.date)['amount'].sum()
+        daily.plot(kind='bar', ax=ax)
+        ax.set_title("每日消费趋势")
+        plt.setp(ax.get_xticklabels(), rotation=45)
+        self.canvas.draw()
+
+    def export_data(self):
+        """导出数据"""
+        save_path = filedialog.asksaveasfilename(
+            defaultextension=".xlsx",
+            filetypes=[("Excel文件", "*.xlsx"), ("CSV文件", "*.csv")]
+        )
+        if save_path:
+            if save_path.endswith('.xlsx'):
+                self.df.to_excel(save_path, index=False)
+            else:
+                self.df.to_csv(save_path, index=False)
 
 
-def clean_item(item):
-    """清理消费项目，去除无关信息"""
-    # 移除时间字符串
-    item = re.sub(r'\d+月\d+日\s?\d+:\d+', '', item)
-    item = re.sub(r'\b(美团|收|已全额退款|收银)\b', '', item).strip()
-    # 移除多余空格
-    item = re.sub(r'\s+', ' ', item).strip()
-    return item
-
-
-def parse_text(text):
-    """解析OCR文本，提取金额、时间和消费项目"""
-    data_list = []
-    current_item = []
-    current_time = None
-    current_amount = None
-    i = 0
-
-    while i < len(text):
-        item = text[i]
-
-        # 跳过非记录行（如“2025年4月”）
-        if "年" in item and "月" in item and "日" not in item:
-            i += 1
-            continue
-
-        # 提取时间（格式：X月X日 HH:MM 或 X月X日HH:MM）
-        time_match = re.search(r'(\d+月\d+日\s?\d+:\d+)', item)
-        if time_match:
-            # 如果找到时间，说明是一条新记录
-            if current_time and current_amount and current_item:
-                # 保存上一条记录
-                cleaned_item = clean_item(' '.join(current_item))
-                if cleaned_item:  # 确保消费项目不为空
-                    data = {
-                        'amount': current_amount,
-                        'time': f"2025年{current_time}",
-                        'item': cleaned_item
-                    }
-                    print(f"提取数据: {data}")
-                    data_list.append(data)
-
-            # 重置当前记录
-            current_item = []
-            current_amount = None
-            # 规范化时间格式，确保“日”后有空格
-            time_str = time_match.group(1)
-            time_str = re.sub(r'(日)(\d+:\d+)', r'\1 \2', time_str)
-            current_time = time_str
-
-            # 寻找最近的金额（向前或向后搜索）
-            # 向前搜索（金额可能在时间之前）
-            for j in range(i - 1, max(-1, i - 5), -1):
-                if j < 0:
-                    break
-                amount_match = re.search(r'([+-]?\d+\.\d+)', text[j])
-                if amount_match:
-                    try:
-                        current_amount = float(amount_match.group(1))
-                        break
-                    except ValueError:
-                        pass
-
-            # 向后搜索（金额可能在时间之后）
-            if not current_amount:
-                for j in range(i + 1, min(len(text), i + 5)):
-                    amount_match = re.search(r'([+-]?\d+\.\d+)', text[j])
-                    if amount_match:
-                        try:
-                            current_amount = float(amount_match.group(1))
-                            i = j  # 跳到金额位置
-                            break
-                        except ValueError:
-                            pass
-
-            i += 1
-            continue
-
-        # 如果不是时间，累积到消费项目
-        current_item.append(item)
-        i += 1
-
-    # 处理最后一条记录
-    if current_time and current_amount and current_item:
-        cleaned_item = clean_item(' '.join(current_item))
-        if cleaned_item:
-            data = {
-                'amount': current_amount,
-                'time': f"2025年{current_time}",
-                'item': cleaned_item
-            }
-            print(f"提取数据: {data}")
-            data_list.append(data)
-
-    return data_list
-
-
-def process_images(image_dir):
-    """处理多个图像文件，提取数据"""
-    data_list = []
-    for filename in os.listdir(image_dir):
-        if filename.endswith('.jpg') or filename.endswith('.png'):
-            image_path = os.path.join(image_dir, filename)
-            text = ocr_image(image_path)
-            records = parse_text(text)
-            data_list.extend(records)
-    return data_list
-
-
-def main(image_dir):
-    """主函数，处理数据并生成图表"""
-    data_list = process_images(image_dir)
-    if not data_list:
-        print("未找到有效数据，请检查截图或调整关键词。")
-        return
-
-    df = pd.DataFrame(data_list)
-    # 规范化时间格式，确保一致
-    df['time'] = df['time'].str.replace(r'(日)(\d+:\d+)', r'\1 \2', regex=True)
-    df['time'] = pd.to_datetime(df['time'], format='%Y年%m月%d日 %H:%M', errors='coerce')
-    df = df.dropna(subset=['time'])  # 移除无法解析的时间
-    df['date'] = df['time'].dt.date
-    daily_spending = df.groupby('date')['amount'].sum()
-
-    plt.figure(figsize=(10, 6))
-    daily_spending.plot(kind='line')
-    plt.title('每日消费金额总结')
-    plt.xlabel('日期')
-    plt.ylabel('总金额 (CNY)')
-    plt.grid(True)
-    plt.show()
-
-
-if __name__ == '__main__':
-    image_dir = 'C:/Users/99362/Desktop/work/test'
-    main(image_dir)
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = OCRApp(root)
+    root.mainloop()
